@@ -158,6 +158,14 @@ class ElevenLabsAudioTranscriptionConfig(BaseAudioTranscriptionConfig):
             transcripts: Final = response_json.get("transcripts")
             if isinstance(transcripts, list):
                 response["transcripts"] = transcripts
+            elif isinstance(response_json.get("words"), list):
+                # Single-channel (mono) response: no `transcripts` array, only flat
+                # top-level `words`. The OpenAI-format `response["words"]` above is
+                # lossy — it renames `text`->`word` and drops spacing/punctuation and
+                # audio events. Wrap the RAW words as one channel so callers get the
+                # same verbatim per-word tokens as multichannel and can segment
+                # bubbles uniformly; without this a mono transcript loses punctuation.
+                response["transcripts"] = [{"channel_index": 0, "words": response_json["words"]}]
             duration: Final = response_json.get("audio_duration_secs")
             if duration is not None:
                 response["audio_duration_secs"] = duration
