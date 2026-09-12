@@ -23,7 +23,7 @@ from ...base_llm.audio_transcription.transformation import (
 from ..common_utils import ElevenLabsException
 
 
-def _to_form_value(value: object) -> str:
+def _to_form_value(value: object) -> Union[str, List[str]]:
     """Serialize a multipart form-field value the way ElevenLabs expects.
 
     httpx (which the ElevenLabs SDK uses) encodes booleans as lowercase
@@ -31,9 +31,17 @@ def _to_form_value(value: object) -> str:
     ElevenLabs API does not recognize — so a boolean flag such as
     ``use_multi_channel`` would be silently ignored and the multichannel
     ``transcripts[]`` response never produced. Normalize bools to lowercase.
+
+    List-valued fields are kept as lists so httpx emits one repeated multipart
+    part per element, which is how ElevenLabs receives a list (``keyterms`` is
+    the one that matters: the realtime endpoint documents it as repeated query
+    params). ``str(["a", "b"])`` would ship the Python repr as a single term —
+    and ``[``/``]`` are characters ElevenLabs rejects inside a keyterm.
     """
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return [_to_form_value(item) for item in value]  # type: ignore[misc]
     return str(value)
 
 
@@ -91,7 +99,7 @@ class ElevenLabsAudioTranscriptionConfig(BaseAudioTranscriptionConfig):
         processed_audio = process_audio_file(audio_file)
 
         # Prepare form data
-        form_data = {"model_id": model}
+        form_data: dict = {"model_id": model}
 
         #########################################################
         # Add OpenAI Compatible Parameters
