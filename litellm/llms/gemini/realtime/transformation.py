@@ -81,12 +81,18 @@ OPENAI_STOCK_REALTIME_VOICES: Final[frozenset[str]] = frozenset(
 )
 
 
-def _gemini_live_speech_config(voice: object) -> Mapping[str, object] | None:
+def _gemini_live_speech_config(
+    voice: object, language_code: object = None
+) -> Mapping[str, object] | None:
     """Build the Gemini Live speechConfig for a client-requested voice.
 
     OpenAI stock voice names have no Gemini equivalent and Gemini Live closes
     the session on an unknown voice, so they are dropped with a warning and
     the model keeps its default voice. Every other name is forwarded verbatim.
+
+    DownstreamPatch(dialogpro): ``language_code`` maps to speechConfig.languageCode
+    — Gemini Live otherwise picks the spoken language on its own and drifts to
+    English mid-conversation. Sourced from ``session.audio.output.language``.
     """
     if isinstance(voice, str) and voice.lower() in OPENAI_STOCK_REALTIME_VOICES:
         verbose_logger.warning(
@@ -95,7 +101,10 @@ def _gemini_live_speech_config(voice: object) -> Mapping[str, object] | None:
             voice,
         )
         return None
-    return VertexGeminiConfig()._map_audio_params({"voice": voice})
+    audio_params: dict = {"voice": voice}
+    if isinstance(language_code, str) and language_code:
+        audio_params["language_code"] = language_code
+    return VertexGeminiConfig()._map_audio_params(audio_params)
 
 
 class _GeminiLiveSetupEnvelope(TypedDict, total=False):
@@ -295,6 +304,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "input_audio_transcription",
             "turn_detection",
             "voice",
+            # DownstreamPatch(dialogpro): langue parlée (speechConfig.languageCode).
+            "language",
         ]
 
     def map_openai_params(self, optional_params: dict, non_default_params: dict) -> dict:
@@ -340,7 +351,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                         automaticActivityDetection=transformed_audio_activity_config
                     )
             elif key == "voice":
-                speech_config = _gemini_live_speech_config(value)
+                speech_config = _gemini_live_speech_config(value, non_default_params.get("language"))
                 if speech_config:
                     optional_params["generationConfig"]["speechConfig"] = speech_config
         if len(optional_params["generationConfig"]) == 0:
@@ -395,6 +406,10 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             if isinstance(input_cfg, dict):
                 if "input_audio_transcription" not in normalized and "transcription" in input_cfg:
                     normalized["input_audio_transcription"] = input_cfg["transcription"]
+            # DownstreamPatch(dialogpro): langue parlée, cf. _gemini_live_speech_config.
+            output_cfg = audio.get("output")
+            if isinstance(output_cfg, dict) and "language" in output_cfg:
+                normalized["language"] = output_cfg["language"]
             output_cfg: Final = audio.get("output")
             if isinstance(output_cfg, dict) and output_cfg.get("voice"):
                 normalized["voice"] = output_cfg["voice"]
