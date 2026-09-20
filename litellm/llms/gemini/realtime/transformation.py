@@ -521,7 +521,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
         if item_type == "function_call_output":
             return self._handle_function_call_output(item)
-        return self._handle_user_text_content(item)
+        # DownstreamPatch(dialogpro): `turn_complete: false` appends to the
+        # conversation WITHOUT giving the floor to the model — replaying a saved
+        # history otherwise produced one spoken answer per replayed item.
+        turn_complete: Final = json_message.get("turn_complete", True)
+        return self._handle_user_text_content(item, turn_complete=bool(turn_complete))
 
     def _handle_function_call_output(self, item: dict) -> list[str]:
         """Transform function_call_output to Gemini toolResponse format."""
@@ -557,8 +561,13 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
         return [json.dumps(tool_response_message)]
 
-    def _handle_user_text_content(self, item: dict) -> list[str]:
-        """Transform user text content to Gemini clientContent format."""
+    def _handle_user_text_content(self, item: dict, turn_complete: bool = True) -> list[str]:
+        """Transform user text content to Gemini clientContent format.
+
+        ``turn_complete=False`` appends the turn to the conversation without
+        asking for a generation (history replay); the caller then sends a
+        ``response.create`` to request exactly one answer.
+        """
         content_list: Final = item.get("content", [])
         text_parts = [c.get("text", "") for c in content_list if isinstance(c, dict) and c.get("type") == "input_text"]
         text: Final = " ".join(filter(None, text_parts))
@@ -568,7 +577,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         client_content_message: Final = {
             "clientContent": {
                 "turns": [{"role": "user", "parts": [{"text": text}]}],
-                "turnComplete": True,
+                "turnComplete": turn_complete,
             }
         }
 
@@ -597,10 +606,17 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             return self._handle_session_update(json_message, model, session_configuration_request)
 
         if msg_type == "response.create":
-            return []  # Gemini responds automatically; nothing to forward
+            # DownstreamPatch(dialogpro): restore the OpenAI item/response split.
+            # Gemini has no response.create, so this used to be dropped — and the
+            # caller's turn never completed unless it happened to arrive on an
+            # item. Emitting a bare turnComplete is Google's documented way to
+            # hand the floor to the model, so a client can add several history
+            # items (turn_complete: false, see _handle_user_text_content) and then
+            # ask for exactly ONE generation, as it does on OpenAI.
+            return [json.dumps({"clientContent": {"turnComplete": True}})]
 
         if msg_type == "conversation.item.create":
-            return self._handle_conversation_item(json_message)
+            return self._handle_conversation_item(json_message)  # honors turn_complete
 
         if msg_type == "input_audio_buffer.append":
             audio_b64: Final = json_message["audio"]
