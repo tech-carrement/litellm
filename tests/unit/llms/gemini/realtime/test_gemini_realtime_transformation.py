@@ -2349,3 +2349,29 @@ def test_gemini_realtime_response_done_reports_no_grounding_when_none_ran():
 
     assert input_details.get("web_search_requests") is None
     assert input_details.get("google_maps_grounding_requests") is None
+
+
+def test_gemini_maps_the_two_vad_sensitivities():
+    """startOfSpeechSensitivity / endOfSpeechSensitivity sont les seuls leviers de
+    Gemini sur le découpage de la parole, et rien ne les remplissait : une app qui
+    streame le micro en continu se faisait couper au milieu d'une phrase. Valeurs
+    hors énumération ignorées — on n'envoie pas à Google ce qu'il refuse."""
+    config = GeminiRealtimeConfig()
+
+    mapped = config.map_automatic_turn_detection(
+        {
+            "type": "server_vad",
+            "create_response": True,
+            "silence_duration_ms": 700,
+            "start_of_speech_sensitivity": "START_SENSITIVITY_LOW",
+            "end_of_speech_sensitivity": "END_SENSITIVITY_LOW",
+        }
+    )
+    assert mapped["startOfSpeechSensitivity"] == "START_SENSITIVITY_LOW"
+    assert mapped["endOfSpeechSensitivity"] == "END_SENSITIVITY_LOW"
+    assert mapped["silenceDurationMs"] == 700
+
+    rejected = config.map_automatic_turn_detection(
+        {"type": "server_vad", "end_of_speech_sensitivity": "TRES_BASSE"}
+    )
+    assert "endOfSpeechSensitivity" not in rejected
