@@ -912,8 +912,10 @@ def test_gemini_tool_call_emits_response_created_preamble():
     #   3: response.function_call_arguments.delta
     #   4: response.function_call_arguments.done
     #   5: response.output_item.done
-    #   6: response.done
-    assert len(responses) >= 7
+    # Et PAS de response.done : un appel d'outil ne termine pas la réponse (Gemini
+    # enchaîne la parole dans le même tour). La fin de tour, c'est turnComplete.
+    assert len(responses) == 6
+    assert not any(ev["type"] == "response.done" for ev in responses)
     assert responses[0]["type"] == "response.created"
     assert "response" in responses[0]
     assert responses[0]["response"]["status"] == "in_progress"
@@ -936,16 +938,14 @@ def test_gemini_tool_call_emits_response_created_preamble():
     assert responses[5]["type"] == "response.output_item.done"
     assert responses[5]["item"]["type"] == "function_call"
     assert responses[5]["item"]["status"] == "completed"
-    assert responses[6]["type"] == "response.done"
-    assert responses[6]["response"]["status"] == "completed"
-    assert len(responses[6]["response"]["output"]) == 1
-    assert responses[6]["response"]["output"][0]["type"] == "function_call"
     assert result["current_output_item_id"] is None
-    assert result["current_response_id"] is None
+    # La réponse reste ouverte : c'est elle que le turnComplete clôturera.
+    assert result["current_response_id"] == responses[0]["response"]["id"]
 
 
-def test_gemini_tool_call_resets_ids_for_post_tool_model_turn():
-    """After tool-call response.done, a subsequent modelTurn must emit response.created."""
+def test_gemini_tool_call_keeps_response_open_for_post_tool_model_turn():
+    """La parole qui suit un appel d'outil appartient à la MÊME réponse : pas de
+    nouveau response.created, et l'identifiant de réponse ne bouge pas."""
     config = GeminiRealtimeConfig()
     logging_obj = MagicMock()
     logging_obj.litellm_trace_id = "trace_123"
@@ -988,7 +988,7 @@ def test_gemini_tool_call_resets_ids_for_post_tool_model_turn():
 
     tool_response_id = tool_result["response"][0]["response"]["id"]
     assert tool_result["current_output_item_id"] is None
-    assert tool_result["current_response_id"] is None
+    assert tool_result["current_response_id"] == tool_response_id
 
     post_tool_result = config.transform_realtime_response(
         json.dumps({"serverContent": {"modelTurn": {"parts": [{"text": "The weather is sunny."}]}}}),
@@ -1006,9 +1006,8 @@ def test_gemini_tool_call_resets_ids_for_post_tool_model_turn():
     )
 
     post_tool_events = post_tool_result["response"]
-    assert post_tool_events[0]["type"] == "response.created"
-    assert post_tool_events[0]["response"]["id"] != tool_response_id
-    assert post_tool_result["current_response_id"] == post_tool_events[0]["response"]["id"]
+    assert not any(ev["type"] == "response.created" for ev in post_tool_events)
+    assert post_tool_result["current_response_id"] == tool_response_id
 
 
 def test_gemini_empty_tool_call_does_not_crash_websocket():
@@ -1074,7 +1073,7 @@ def test_gemini_empty_tool_call_with_sibling_usage_metadata_does_not_crash():
     assert result["current_output_item_id"] == "item_existing"
 
 
-def test_gemini_tool_call_response_done_includes_usage_from_sibling_metadata():
+def test_gemini_tool_call_usage_is_carried_to_the_turn_response_done():
     """A ``toolCall`` frame with a sibling ``usageMetadata`` must propagate the
     real token counts onto the emitted ``response.done`` so spend/budget
     accounting records tokens consumed by the tool-call turn — otherwise an
@@ -1121,7 +1120,42 @@ def test_gemini_tool_call_response_done_includes_usage_from_sibling_metadata():
         },
     )
 
-    response_done = next(ev for ev in result["response"] if ev.get("type") == "response.done")
+    # Le toolCall n'émet plus de response.done : les tokens sont mis de côté et
+    # portés par le response.done du turnComplete qui clôt le tour.
+    assert not any(ev.get("type") == "response.done" for ev in result["response"])
+    # La réponse parlée qui suit l'appel d'outil, puis la fin de tour.
+    answer_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"modelTurn": {"parts": [{"text": "It is sunny."}]}}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": result["current_output_item_id"],
+            "current_response_id": result["current_response_id"],
+            "current_conversation_id": result["current_conversation_id"],
+            "current_delta_chunks": result["current_delta_chunks"],
+            "current_item_chunks": result["current_item_chunks"],
+            "current_delta_type": result["current_delta_type"],
+        },
+    )
+    turn_complete_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"turnComplete": True}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": answer_result["current_output_item_id"],
+            "current_response_id": answer_result["current_response_id"],
+            "current_conversation_id": answer_result["current_conversation_id"],
+            "current_delta_chunks": answer_result["current_delta_chunks"],
+            "current_item_chunks": answer_result["current_item_chunks"],
+            "current_delta_type": answer_result["current_delta_type"],
+        },
+    )
+
+    response_done = next(
+        ev for ev in turn_complete_result["response"] if ev.get("type") == "response.done"
+    )
     usage = response_done["response"]["usage"]
     assert usage["input_tokens"] == 17
     assert usage["output_tokens"] == 4
@@ -1130,7 +1164,7 @@ def test_gemini_tool_call_response_done_includes_usage_from_sibling_metadata():
     assert usage["output_token_details"]["text_tokens"] == 4
 
 
-def test_gemini_tool_call_response_done_falls_back_to_empty_usage():
+def test_gemini_tool_call_turn_response_done_falls_back_to_empty_usage():
     """Without sibling ``usageMetadata`` the tool-call ``response.done`` still
     carries a valid empty usage block so OpenAI-compatible clients (which
     expect ``usage`` on every ``response.done``) don't break."""
@@ -1165,7 +1199,42 @@ def test_gemini_tool_call_response_done_falls_back_to_empty_usage():
         },
     )
 
-    response_done = next(ev for ev in result["response"] if ev.get("type") == "response.done")
+    # Le toolCall n'émet plus de response.done : les tokens sont mis de côté et
+    # portés par le response.done du turnComplete qui clôt le tour.
+    assert not any(ev.get("type") == "response.done" for ev in result["response"])
+    # La réponse parlée qui suit l'appel d'outil, puis la fin de tour.
+    answer_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"modelTurn": {"parts": [{"text": "It is sunny."}]}}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": result["current_output_item_id"],
+            "current_response_id": result["current_response_id"],
+            "current_conversation_id": result["current_conversation_id"],
+            "current_delta_chunks": result["current_delta_chunks"],
+            "current_item_chunks": result["current_item_chunks"],
+            "current_delta_type": result["current_delta_type"],
+        },
+    )
+    turn_complete_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"turnComplete": True}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": answer_result["current_output_item_id"],
+            "current_response_id": answer_result["current_response_id"],
+            "current_conversation_id": answer_result["current_conversation_id"],
+            "current_delta_chunks": answer_result["current_delta_chunks"],
+            "current_item_chunks": answer_result["current_item_chunks"],
+            "current_delta_type": answer_result["current_delta_type"],
+        },
+    )
+
+    response_done = next(
+        ev for ev in turn_complete_result["response"] if ev.get("type") == "response.done"
+    )
     usage = response_done["response"]["usage"]
     assert usage["input_tokens"] == 0
     assert usage["output_tokens"] == 0
@@ -1466,7 +1535,7 @@ def test_gemini_standalone_usage_metadata_does_not_crash_websocket():
     assert result["current_conversation_id"] == "conv_existing"
 
 
-def test_gemini_standalone_usage_metadata_is_attributed_to_next_tool_call_response_done():
+def test_gemini_standalone_usage_metadata_is_attributed_to_the_tool_call_turn_response_done():
     """A standalone ``usageMetadata`` frame emitted between turns must not
     silently drop the consumed tokens. The next tool-call ``response.done``
     must carry those token counts so an authenticated client cannot drive
@@ -1527,7 +1596,42 @@ def test_gemini_standalone_usage_metadata_is_attributed_to_next_tool_call_respon
         },
     )
 
-    response_done = next(ev for ev in tool_call_result["response"] if ev.get("type") == "response.done")
+    # Le toolCall ne clôt plus la réponse : les tokens restent en attente du
+    # response.done du turnComplete, qui est la vraie fin de tour.
+    assert not any(ev.get("type") == "response.done" for ev in tool_call_result["response"])
+    # La réponse parlée qui suit l'appel d'outil, puis la fin de tour.
+    answer_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"modelTurn": {"parts": [{"text": "It is sunny."}]}}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": tool_call_result["current_output_item_id"],
+            "current_response_id": tool_call_result["current_response_id"],
+            "current_conversation_id": tool_call_result["current_conversation_id"],
+            "current_delta_chunks": tool_call_result["current_delta_chunks"],
+            "current_item_chunks": tool_call_result["current_item_chunks"],
+            "current_delta_type": tool_call_result["current_delta_type"],
+        },
+    )
+    turn_complete_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"turnComplete": True}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": answer_result["current_output_item_id"],
+            "current_response_id": answer_result["current_response_id"],
+            "current_conversation_id": answer_result["current_conversation_id"],
+            "current_delta_chunks": answer_result["current_delta_chunks"],
+            "current_item_chunks": answer_result["current_item_chunks"],
+            "current_delta_type": answer_result["current_delta_type"],
+        },
+    )
+
+    response_done = next(
+        ev for ev in turn_complete_result["response"] if ev.get("type") == "response.done"
+    )
     usage = response_done["response"]["usage"]
     assert usage["input_tokens"] == 31
     assert usage["output_tokens"] == 9
@@ -1645,7 +1749,47 @@ def test_gemini_in_frame_usage_metadata_clears_pending_buffer():
         },
     )
 
-    response_done = next(ev for ev in result["response"] if ev.get("type") == "response.done")
+    # Les compteurs de la trame écrasent le buffer (3/2/5 et non 99/99/198) ; ils
+    # ressortent sur le response.done du turnComplete, seule fin de tour.
+    assert not any(ev.get("type") == "response.done" for ev in result["response"])
+    assert config._pending_usage_metadata == {
+        "promptTokenCount": 3,
+        "responseTokenCount": 2,
+        "totalTokenCount": 5,
+    }
+    # La réponse parlée qui suit l'appel d'outil, puis la fin de tour.
+    answer_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"modelTurn": {"parts": [{"text": "It is sunny."}]}}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": result["current_output_item_id"],
+            "current_response_id": result["current_response_id"],
+            "current_conversation_id": result["current_conversation_id"],
+            "current_delta_chunks": result["current_delta_chunks"],
+            "current_item_chunks": result["current_item_chunks"],
+            "current_delta_type": result["current_delta_type"],
+        },
+    )
+    turn_complete_result = config.transform_realtime_response(
+        json.dumps({"serverContent": {"turnComplete": True}}),
+        "gemini-2.5-flash",
+        logging_obj,
+        realtime_response_transform_input={
+            "session_configuration_request": None,
+            "current_output_item_id": answer_result["current_output_item_id"],
+            "current_response_id": answer_result["current_response_id"],
+            "current_conversation_id": answer_result["current_conversation_id"],
+            "current_delta_chunks": answer_result["current_delta_chunks"],
+            "current_item_chunks": answer_result["current_item_chunks"],
+            "current_delta_type": answer_result["current_delta_type"],
+        },
+    )
+
+    response_done = next(
+        ev for ev in turn_complete_result["response"] if ev.get("type") == "response.done"
+    )
     usage = response_done["response"]["usage"]
     assert usage["input_tokens"] == 3
     assert usage["output_tokens"] == 2
@@ -1655,11 +1799,9 @@ def test_gemini_in_frame_usage_metadata_clears_pending_buffer():
 
 def test_gemini_post_tool_bare_turn_complete_followed_by_answer():
     """After a tool call, Gemini Live can emit a bare ``turnComplete`` (with
-    usage but no model content) before the follow-up answer stream. That bare
-    ``turnComplete`` may produce an extra ``response.done``; Pipecat is tolerant
-    of that because ``_process_completed_function_calls`` is idempotent (the
-    pending call queue is empty by the time the second ``response.done`` arrives).
-    The important thing is that the post-tool answer is correctly generated."""
+    usage but no model content) before the follow-up answer stream. Ni l'appel
+    d'outil ni ce turnComplete nu ne produisent de response.done : le tour ne se
+    clôt qu'une fois, à la fin de la réponse parlée qui suit."""
     config = GeminiRealtimeConfig()
     logging_obj = MagicMock()
     logging_obj.litellm_trace_id = "trace_post_tool_bare_turn_complete"
@@ -1700,7 +1842,8 @@ def test_gemini_post_tool_bare_turn_complete_followed_by_answer():
         logging_obj,
         realtime_response_transform_input=base_input,
     )
-    assert tool_result["response"][-1]["type"] == "response.done"
+    assert tool_result["response"][-1]["type"] == "response.output_item.done"
+    assert not any(ev["type"] == "response.done" for ev in tool_result["response"])
 
     bare_turn_complete = config.transform_realtime_response(
         json.dumps(
@@ -1760,7 +1903,8 @@ def test_gemini_post_tool_bare_turn_complete_followed_by_answer():
             "current_delta_type": bare_turn_complete["current_delta_type"],
         },
     )
-    assert post_tool_answer["response"][0]["type"] == "response.created"
+    # Même réponse que l'appel d'outil : pas de second response.created.
+    assert not any(ev["type"] == "response.created" for ev in post_tool_answer["response"])
     transcript_delta = next(
         event for event in post_tool_answer["response"] if event["type"] == "response.output_audio_transcript.delta"
     )
