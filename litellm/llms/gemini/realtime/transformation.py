@@ -5,7 +5,7 @@ This file contains the transformation logic for the Gemini realtime API.
 import json
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from typing import Any, Final, cast
+from typing import Any, Final, cast, get_args
 
 from typing_extensions import ReadOnly, Required, TypedDict
 
@@ -27,6 +27,8 @@ from litellm.types.llms.gemini import (
     BidiGenerateContentServerContent,
     BidiGenerateContentServerMessage,
     BidiGenerateContentSetup,
+    EndOfSpeechSensitivityEnum,
+    StartOfSpeechSensitivityEnum,
 )
 from litellm.types.llms.openai import (
     OpenAIRealtimeContentPartDone,
@@ -295,6 +297,22 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             automatic_activity_dection["prefixPaddingMs"] = value["prefix_padding_ms"]
         if "silence_duration_ms" in value and isinstance(value["silence_duration_ms"], int):
             automatic_activity_dection["silenceDurationMs"] = value["silence_duration_ms"]
+        # DownstreamPatch(dialogpro): les deux sensibilités du VAD de Gemini, que rien
+        # ne remplissait. OpenAI n'a pas d'équivalent, donc le client les passe sous
+        # leur nom Gemini en snake_case. Sans elles, une application qui streame le
+        # micro en continu voit le modèle découper une phrase en fragments (« chi »
+        # pour « ... ») : détection de FIN de parole trop pressée, l'utilisateur doit
+        # répéter. Mesuré sur un vrai appareil.
+        start_sensitivity = value.get("start_of_speech_sensitivity")
+        if start_sensitivity in get_args(StartOfSpeechSensitivityEnum):
+            automatic_activity_dection["startOfSpeechSensitivity"] = cast(
+                StartOfSpeechSensitivityEnum, start_sensitivity
+            )
+        end_sensitivity = value.get("end_of_speech_sensitivity")
+        if end_sensitivity in get_args(EndOfSpeechSensitivityEnum):
+            automatic_activity_dection["endOfSpeechSensitivity"] = cast(
+                EndOfSpeechSensitivityEnum, end_sensitivity
+            )
         return automatic_activity_dection
 
     def get_supported_openai_params(self, model: str) -> list[str]:
