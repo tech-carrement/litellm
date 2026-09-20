@@ -1538,14 +1538,16 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 _has_pending_function_call = current_item_chunks and any(
                     chunk.get("item", {}).get("type") == "function_call" for chunk in current_item_chunks
                 )
-                if _has_pending_function_call:
+                if current_response_id is None and _has_pending_function_call:
                     # Trailing bare turnComplete after a toolCall (Vertex emits ~5
-                    # bookkeeping tokens before the follow-up answer). Suppress the
-                    # empty response.done so collect_until("response.done") clients
-                    # don't stop prematurely; buffer usage for the next real turn.
-                    # (La condition portait aussi sur current_response_id is None, que
-                    # le toolCall remettait à zéro en clôturant la réponse ; il ne la
-                    # clôture plus, donc seul l'appel d'outil en attente discrimine.)
+                    # bookkeeping tokens before the follow-up answer) alors qu'AUCUNE
+                    # réponse n'est ouverte : il n'y a rien à clôturer, et un done de
+                    # plus ferait stopper les clients en collect_until("response.done")
+                    # avant la vraie réponse. On garde les tokens pour le tour suivant.
+                    # Quand une réponse EST ouverte, il faut au contraire la clôturer :
+                    # l'app cliente épingle son activeResponseId sur response.created et
+                    # ne le libère que sur le response.done du même id — une réponse
+                    # laissée ouverte la rend sourde à tout déclencheur (vécu).
                     standalone_usage_metadata = json_message.get("usageMetadata")
                     if isinstance(standalone_usage_metadata, dict):
                         self._pending_usage_metadata = standalone_usage_metadata

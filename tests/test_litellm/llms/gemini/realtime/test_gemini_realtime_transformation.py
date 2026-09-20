@@ -1868,10 +1868,14 @@ def test_gemini_post_tool_bare_turn_complete_followed_by_answer():
             "current_delta_type": tool_result["current_delta_type"],
         },
     )
-    # The bare turnComplete must not surface as a response.done because clients
-    # that use collect_until("response.done") would stop collecting prematurely
-    # before the real follow-up answer arrives.
-    assert bare_turn_complete["response"] == []
+    # Le turnComplete nu clôture la réponse ouverte par l'appel d'outil : un
+    # response.created sans response.done fige les clients qui épinglent l'id de
+    # la réponse en cours. La réponse parlée qui suit ouvrira la sienne.
+    bare_done = next(
+        ev for ev in bare_turn_complete["response"] if ev["type"] == "response.done"
+    )
+    assert bare_done["response"]["id"] == tool_result["current_response_id"]
+    assert [item["type"] for item in bare_done["response"]["output"]] == ["function_call"]
 
     post_tool_answer = config.transform_realtime_response(
         json.dumps(
@@ -1903,8 +1907,8 @@ def test_gemini_post_tool_bare_turn_complete_followed_by_answer():
             "current_delta_type": bare_turn_complete["current_delta_type"],
         },
     )
-    # Même réponse que l'appel d'outil : pas de second response.created.
-    assert not any(ev["type"] == "response.created" for ev in post_tool_answer["response"])
+    # La réponse de l'appel d'outil est close : la parole ouvre la sienne.
+    assert post_tool_answer["response"][0]["type"] == "response.created"
     transcript_delta = next(
         event for event in post_tool_answer["response"] if event["type"] == "response.output_audio_transcript.delta"
     )
