@@ -602,7 +602,14 @@ class RealTimeStreaming:
             msg_obj: Final = _decode_json_object(message)
         except (json.JSONDecodeError, TypeError):
             return False
-        return msg_obj.get("type") in RealTimeStreaming._CLIENT_AUDIO_BUFFER_TYPES
+        # DownstreamPatch(dialogpro): hold EVERY client frame, not only audio, until the
+        # backend acknowledges the setup. Anything that reaches Gemini Live between
+        # our `setup` and its `setupComplete` is answered with the text "Error: Session
+        # is not set up yet" and dropped — a `response.create`/`conversation.item.create`
+        # sent right after the (synthetic) session.created lost the opening turn every
+        # time on gemini-3.8-live in VIDEO mode (setup ≈ 300 ms). Only the
+        # `session.update` that triggers the setup may pass.
+        return msg_obj.get("type") != "session.update"
 
     def _buffer_pending_message_until_setup(self, message: str) -> None:
         try:

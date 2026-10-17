@@ -3550,3 +3550,39 @@ async def test_provider_bytes_are_sent_raw_after_pacing():
 
     assert [call.args[0] for call in backend_ws.send.await_args_list] == [b"\x00\x01", '{"type":"endStream"}']
     provider_config.pace_backend_send.assert_awaited_once_with(b"\x00\x01")
+
+
+@pytest.mark.asyncio
+async def test_deferred_setup_holds_every_client_frame_until_backend_setup_complete(monkeypatch):
+    """DownstreamPatch(dialogpro): a response.create (or any item) that reaches Gemini
+    between our `setup` and its `setupComplete` is answered with the text
+    "Error: Session is not set up yet" and dropped. Measured on gemini-3.8-live in
+    VIDEO mode (setup takes ~300 ms): the opening turn was lost every time. Only the
+    `session.update` that triggers the setup may pass; everything else waits."""
+    monkeypatch.setattr(litellm, "gemini_live_defer_setup", True, raising=False)
+    from litellm.llms.gemini.realtime.transformation import GeminiRealtimeConfig
+
+    client_ws = MagicMock()
+    session_update = json.dumps({"type": "session.update", "session": {"modalities": ["audio"]}})
+    item = json.dumps({"type": "conversation.item.create", "turn_complete": False,
+                       "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ctx"}]}})
+    trigger = json.dumps({"type": "response.create"})
+    client_ws.receive_text = AsyncMock(side_effect=[session_update, item, trigger, ConnectionClosed(None, None)])
+    backend_ws = MagicMock()
+    backend_ws.send = AsyncMock()
+
+    streaming = RealTimeStreaming(client_ws, backend_ws, MagicMock(), provider_config=GeminiRealtimeConfig(),
+                                  model="gemini-3.8-live")
+    await streaming.client_ack_messages()
+
+    # Only the setup went out; the item and the trigger wait for setupComplete.
+    assert backend_ws.send.call_count == 1
+    assert "setup" in json.loads(backend_ws.send.call_args_list[0].args[0])
+    assert len(streaming._pending_messages_until_setup) == 2
+
+    streaming._backend_setup_complete = True
+    await streaming._flush_pending_messages_until_setup()
+    assert backend_ws.send.call_count == 3
+    sent_after = [json.loads(c.args[0]) for c in backend_ws.send.call_args_list[1:]]
+    assert "clientContent" in sent_after[0] and sent_after[0]["clientContent"].get("turnComplete") is False
+    assert sent_after[1] == {"clientContent": {"turnComplete": True}}
