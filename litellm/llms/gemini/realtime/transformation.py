@@ -237,7 +237,9 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         if "parts" in model_turn:
             parts: Final = model_turn["parts"]
             if len(parts) != 1:
-                verbose_logger.warning("Realtime: Expected 1 part, got %s for Gemini model turn event.", len(parts))
+                # DownstreamPatch(dialogpro): debug, not warning — avatar frames carry
+                # a video part next to the audio one, 24 times a second.
+                verbose_logger.debug("Realtime: Expected 1 part, got %s for Gemini model turn event.", len(parts))
             part: Final = parts[0]
             if "text" in part:
                 return OpenAIRealtimeEventTypes.RESPONSE_TEXT_DELTA
@@ -340,6 +342,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "voice",
             # DownstreamPatch(dialogpro): langue parlée (speechConfig.languageCode).
             "language",
+            # DownstreamPatch(dialogpro): Live Avatar (avatarConfig.avatarName).
+            "avatar",
         ]
 
     def map_openai_params(self, optional_params: dict, non_default_params: dict) -> dict:
@@ -388,6 +392,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 speech_config = _gemini_live_speech_config(value, non_default_params.get("language"))
                 if speech_config:
                     optional_params["generationConfig"]["speechConfig"] = speech_config
+            elif key == "avatar" and isinstance(value, str) and value:
+                # DownstreamPatch(dialogpro): Gemini 3.8 Live Avatar — a prebuilt
+                # avatar name; pairs with responseModalities ["VIDEO"] (the caller
+                # sends output_modalities ["video"]). Top-level setup field.
+                optional_params["avatarConfig"] = {"avatarName": value}
         if len(optional_params["generationConfig"]) == 0:
             optional_params.pop("generationConfig")
         return optional_params
@@ -855,7 +864,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 for part in message["modelTurn"]["parts"]:
                     if "text" in part:
                         delta += part["text"]
-                    elif "inlineData" in part:
+                    elif "inlineData" in part and not self._is_video_part(part):
                         delta += part["inlineData"].get("data", "")
         except Exception as e:
             raise ValueError(f"Error transforming content delta events: {e}, got message: {message}")
@@ -869,6 +878,40 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             response_id=response_id,
             delta=delta,
         )
+
+    @staticmethod
+    def _is_video_part(part: dict) -> bool:
+        return str((part.get("inlineData") or {}).get("mimeType", "")).startswith("video/")
+
+    def transform_video_delta_events(
+        self,
+        message: BidiGenerateContentServerContent,
+        output_item_id: str,
+        response_id: str,
+    ) -> list[dict]:
+        """DownstreamPatch(dialogpro): Gemini 3.8 Live Avatar.
+
+        Each ``video/*`` inlineData part (a fragmented-MP4 chunk, H.264 + AAC,
+        in stream order) becomes one ``response.output_video.delta`` — a
+        dialogpro extension of the OpenAI realtime vocabulary, forwarded as-is
+        by the proxy to the apps. Video rides the audio delta type: no new
+        state, the audio/item done events close the item as usual.
+        """
+        parts = (message.get("modelTurn") or {}).get("parts") or []
+        return [
+            {
+                "type": "response.output_video.delta",
+                "event_id": f"event_{uuid.uuid4()}",
+                "response_id": response_id,
+                "item_id": output_item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "mime_type": part["inlineData"].get("mimeType"),
+                "delta": part["inlineData"].get("data", ""),
+            }
+            for part in parts
+            if self._is_video_part(part)
+        ]
 
     def transform_content_done_event(
         self,
@@ -1130,6 +1173,15 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             _chat_completion_usage,
         )
         _usage_dict: Final = responses_api_usage.model_dump()
+        # DownstreamPatch(dialogpro): the responses-usage conversion keeps only
+        # text/audio/image output details; Live Avatar video tokens
+        # (candidatesTokensDetails modality VIDEO) would be lost. Carry them so the
+        # proxy can bill them.
+        _video_tokens: Final = getattr(
+            getattr(_chat_completion_usage, "completion_tokens_details", None), "video_tokens", None
+        )
+        if _video_tokens:
+            _usage_dict.setdefault("output_tokens_details", {})["video_tokens"] = _video_tokens
         self._add_pipecat_usage_detail_aliases(_usage_dict)
         response_done_event: Final = OpenAIRealtimeDoneEvent(
             type="response.done",
@@ -1186,13 +1238,21 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 )
 
             # send the list of standard 'new' content.delta events
+            server_content: Final = BidiGenerateContentServerContent(**json_message["serverContent"])
             transformed_message: Final = self.transform_content_delta_events(
-                BidiGenerateContentServerContent(**json_message["serverContent"]),
+                server_content,
                 current_output_item_id,
                 current_response_id,
                 delta_type=delta_type,
             )
-            returned_message.append(transformed_message)
+            # DownstreamPatch(dialogpro): video parts (Live Avatar) get their own
+            # events; a video-only frame emits no empty audio delta.
+            video_events: Final = self.transform_video_delta_events(
+                server_content, current_output_item_id, current_response_id
+            )
+            if transformed_message["delta"] or not video_events:
+                returned_message.append(transformed_message)
+            returned_message.extend(cast(list[OpenAIRealtimeEvents], video_events))
         elif (
             openai_event == OpenAIRealtimeEventTypes.RESPONSE_TEXT_DONE
             or openai_event == OpenAIRealtimeEventTypes.RESPONSE_AUDIO_DONE
