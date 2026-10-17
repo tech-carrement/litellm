@@ -38,6 +38,7 @@ from litellm.types.llms.openai import (
     OpenAIRealtimeEventTypes,
     OpenAIRealtimeFunctionCallArgumentsDone,
     OpenAIRealtimeOutputItemDone,
+    OpenAIRealtimeOutputVideoDelta,
     OpenAIRealtimeResponseAudioDone,
     OpenAIRealtimeResponseContentPartAdded,
     OpenAIRealtimeResponseDelta,
@@ -55,6 +56,7 @@ from litellm.types.llms.vertex_ai import (
     GeminiResponseModalities,
     HttpxBlobType,
     HttpxContentType,
+    HttpxPartType,
 )
 from litellm.types.realtime import (
     ALL_DELTA_TYPES,
@@ -90,6 +92,16 @@ _END_OF_SPEECH_SENSITIVITIES: Final[Mapping[object, EndOfSpeechSensitivityEnum]]
 OPENAI_STOCK_REALTIME_VOICES: Final[frozenset[str]] = frozenset(
     {"alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage", "shimmer", "verse"}
 )
+
+
+_GENERATION_CONFIG_SCALARS: Final[Mapping[str, str]] = {
+    "temperature": "temperature",
+    "max_response_output_tokens": "maxOutputTokens",
+}
+_AVATAR_CONFIG_KEYS: Final[Mapping[str, str]] = {
+    "avatar": "avatarName",
+    "avatar_video_bitrate_bps": "videoBitrateBps",
+}
 
 
 def _gemini_live_speech_config(voice: object, language_code: str | None = None) -> Mapping[str, object] | None:
@@ -258,7 +270,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         if "parts" in model_turn:
             parts: Final = model_turn["parts"]
             if len(parts) != 1:
-                verbose_logger.warning("Realtime: Expected 1 part, got %s for Gemini model turn event.", len(parts))
+                verbose_logger.debug("Realtime: Expected 1 part, got %s for Gemini model turn event.", len(parts))
             part: Final = parts[0]
             if "text" in part:
                 return OpenAIRealtimeEventTypes.RESPONSE_TEXT_DELTA
@@ -355,6 +367,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "turn_detection",
             "voice",
             "language",
+            "avatar",
+            "avatar_video_bitrate_bps",
         ]
 
     def map_openai_params(self, optional_params: dict, non_default_params: dict) -> dict:
@@ -363,10 +377,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         for key, value in non_default_params.items():
             if key == "instructions":
                 optional_params["systemInstruction"] = HttpxContentType(role="user", parts=[{"text": value}])
-            elif key == "temperature":
-                optional_params["generationConfig"]["temperature"] = value
-            elif key == "max_response_output_tokens":
-                optional_params["generationConfig"]["maxOutputTokens"] = value
+            elif key in _GENERATION_CONFIG_SCALARS:
+                optional_params["generationConfig"][_GENERATION_CONFIG_SCALARS[key]] = value
             elif key == "modalities":
                 optional_params["generationConfig"]["responseModalities"] = [
                     modality.upper() for modality in cast(list[str], value)
@@ -408,6 +420,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 )
                 if speech_config:
                     optional_params["generationConfig"]["speechConfig"] = speech_config
+            elif key in _AVATAR_CONFIG_KEYS and value:
+                optional_params.setdefault("avatarConfig", {})[_AVATAR_CONFIG_KEYS[key]] = value
         if len(optional_params["generationConfig"]) == 0:
             optional_params.pop("generationConfig")
         return optional_params
@@ -865,7 +879,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 for part in message["modelTurn"]["parts"]:
                     if "text" in part:
                         delta += part["text"]
-                    elif "inlineData" in part:
+                    elif "inlineData" in part and self._video_mime_type(part) is None:
                         delta += part["inlineData"].get("data", "")
         except Exception as e:
             raise ValueError(f"Error transforming content delta events: {e}, got message: {message}")
@@ -879,6 +893,45 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             response_id=response_id,
             delta=delta,
         )
+
+    @staticmethod
+    def _video_mime_type(part: HttpxPartType) -> str | None:
+        inline_data: Final = part.get("inlineData")
+        mime_type: Final = inline_data.get("mimeType") if inline_data else None
+        return mime_type if mime_type is not None and mime_type.startswith("video/") else None
+
+    @staticmethod
+    def _model_turn_parts(server_content: BidiGenerateContentServerContent) -> Sequence[HttpxPartType]:
+        return server_content["modelTurn"].get("parts", []) if "modelTurn" in server_content else []
+
+    def _video_delta(
+        self, part: HttpxPartType, output_item_id: str | None, response_id: str | None
+    ) -> OpenAIRealtimeOutputVideoDelta | None:
+        mime_type: Final = self._video_mime_type(part)
+        if mime_type is None:
+            return None
+        inline_data: Final = part.get("inlineData")
+        return {
+            "type": "response.output_video.delta",
+            "event_id": new_event_id(),
+            "response_id": response_id,
+            "item_id": output_item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "mime_type": mime_type,
+            "delta": inline_data.get("data", "") if inline_data else "",
+        }
+
+    def transform_video_delta_events(
+        self,
+        parts: Sequence[HttpxPartType],
+        output_item_id: str | None,
+        response_id: str | None,
+    ) -> Sequence[OpenAIRealtimeOutputVideoDelta]:
+        """Each video/* inlineData part (a fragmented MP4 chunk) becomes one
+        response.output_video.delta; the audio and item done events close the item."""
+        deltas: Final = (self._video_delta(part, output_item_id, response_id) for part in parts)
+        return [delta for delta in deltas if delta is not None]
 
     def transform_content_done_event(
         self,
@@ -1140,6 +1193,12 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             _chat_completion_usage,
         )
         _usage_dict: Final = responses_api_usage.model_dump()
+        # the responses usage conversion drops video output tokens
+        _video_tokens: Final = getattr(
+            getattr(_chat_completion_usage, "completion_tokens_details", None), "video_tokens", None
+        )
+        if _video_tokens:
+            _usage_dict.setdefault("output_tokens_details", {})["video_tokens"] = _video_tokens
         self._add_pipecat_usage_detail_aliases(_usage_dict)
         response_done_event: Final = OpenAIRealtimeDoneEvent(
             type="response.done",
@@ -1194,13 +1253,21 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 )
 
             # send the list of standard 'new' content.delta events
+            server_content: Final = BidiGenerateContentServerContent(**json_message["serverContent"])
             transformed_message: Final = self.transform_content_delta_events(
-                BidiGenerateContentServerContent(**json_message["serverContent"]),
+                server_content,
                 current_output_item_id,
                 current_response_id,
                 delta_type=delta_type,
             )
-            returned_message.append(transformed_message)
+            video_events: Final = self.transform_video_delta_events(
+                server_content["modelTurn"].get("parts", []) if "modelTurn" in server_content else [],
+                current_output_item_id,
+                current_response_id,
+            )
+            if transformed_message["delta"] or not video_events:
+                returned_message.append(transformed_message)
+            returned_message.extend(video_events)
         elif (
             openai_event == OpenAIRealtimeEventTypes.RESPONSE_TEXT_DONE
             or openai_event == OpenAIRealtimeEventTypes.RESPONSE_AUDIO_DONE
@@ -1341,8 +1408,22 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 )
             if "turnComplete" in server_content:
                 self._generation_requested = False
-            input_tx: Final = server_content.get("inputTranscription")
-            if isinstance(input_tx, dict) and input_tx.get("text"):
+            # Live Avatar video flows continuously, outside any turn: a video-only model
+            # turn must not open a response; the spoken turn is opened by its transcript
+            _avatar_parts: Final = self._model_turn_parts(
+                cast(BidiGenerateContentServerContent, server_content)  # cast-ok: a serverContent frame
+            )
+            if _avatar_parts and all(self._video_mime_type(part) is not None for part in _avatar_parts):
+                returned_message.extend(
+                    self.transform_video_delta_events(_avatar_parts, current_output_item_id, current_response_id)
+                )
+                del server_content["modelTurn"]
+            if (
+                "inputTranscription" in server_content
+                and isinstance(input_tx := server_content["inputTranscription"], dict)
+                and "text" in input_tx
+                and input_tx["text"]
+            ):
                 transcription_usage: Final = self._consume_input_transcription_usage_estimate(model)
                 returned_message.append(
                     cast(
@@ -1374,6 +1455,10 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                             delta_type="audio",
                         )
                     )
+                    # with avatar video the audio is muxed in the mp4, no audio part comes:
+                    # the transcript-opened item must still be closed by generationComplete
+                    if current_delta_type is None:
+                        current_delta_type = "audio"  # rebind-ok: the transcript opened an audio item
                 returned_message.append(
                     cast(
                         OpenAIRealtimeEvents,
