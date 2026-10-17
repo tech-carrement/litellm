@@ -348,6 +348,14 @@ def test_transform_audio_transcription_response_keeps_multichannel_transcripts()
 
 
 def test_transform_audio_transcription_response_without_transcripts_has_no_transcripts_key():
-    response: Final = _transform({"language_code": "fra", "text": "bonjour", "words": []})
+    response: Final = _transform({"language_code": "fra", "text": "bonjour"})
 
     assert "transcripts" not in response
+
+
+def test_transform_audio_transcription_response_wraps_mono_words_as_one_channel():
+    """Fork-only: a mono response carries its raw words as channel 0, like multichannel."""
+    words: Final = [{"text": "bonjour", "type": "word", "start": 0.1, "end": 0.5}]
+    response: Final = _transform({"language_code": "fra", "text": "bonjour", "words": words})
+
+    assert response["transcripts"] == [{"channel_index": 0, "words": words}]
