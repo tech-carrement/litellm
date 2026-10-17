@@ -3550,3 +3550,40 @@ async def test_provider_bytes_are_sent_raw_after_pacing():
 
     assert [call.args[0] for call in backend_ws.send.await_args_list] == [b"\x00\x01", '{"type":"endStream"}']
     provider_config.pace_backend_send.assert_awaited_once_with(b"\x00\x01")
+
+
+@pytest.mark.asyncio
+async def test_deferred_setup_holds_every_client_frame_until_backend_setup_complete(monkeypatch):
+    """A client frame that reaches Gemini Live between the setup and its setupComplete is
+    answered with the text "Error: Session is not set up yet" and dropped. Only the
+    session.update that triggers the setup may pass; items, triggers and audio wait."""
+    monkeypatch.setattr(litellm, "gemini_live_defer_setup", True, raising=False)
+    from litellm.llms.gemini.realtime.transformation import GeminiRealtimeConfig
+
+    client_ws = MagicMock()
+    session_update: Final = json.dumps({"type": "session.update", "session": {"modalities": ["audio"]}})
+    item: Final = json.dumps(
+        {
+            "type": "conversation.item.create",
+            "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ctx"}]},
+        }
+    )
+    trigger: Final = json.dumps({"type": "response.create"})
+    audio: Final = json.dumps({"type": "input_audio_buffer.append", "audio": "AA=="})
+    client_ws.receive_text = AsyncMock(side_effect=[session_update, item, trigger, audio, ConnectionClosed(None, None)])
+    backend_ws = MagicMock()
+    backend_ws.send = AsyncMock()
+
+    streaming: Final = RealTimeStreaming(
+        client_ws, backend_ws, MagicMock(), provider_config=GeminiRealtimeConfig(), model="gemini-3.8-live"
+    )
+    await streaming.client_ack_messages()
+
+    assert backend_ws.send.call_count == 1
+    assert "setup" in json.loads(backend_ws.send.call_args_list[0].args[0])
+    assert len(streaming._pending_messages_until_setup) == 3
+
+    streaming._backend_setup_complete = True
+    await streaming._flush_pending_messages_until_setup()
+    sent_after: Final = [json.loads(call.args[0]) for call in backend_ws.send.call_args_list[1:]]
+    assert [next(iter(frame)) for frame in sent_after] == ["clientContent", "realtimeInput"]
