@@ -1464,6 +1464,13 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                             include_response_created=not _tx_response_was_open,
                         )
                     )
+                    # DownstreamPatch(dialogpro): the item opened here is an audio item
+                    # (Live Avatar: the audio is muxed in the video, no audio part ever
+                    # comes). Without a delta type, generationComplete is dropped below
+                    # and the item is never closed — measured: the proxy's opening-turn
+                    # guard then dropped the client's next trigger.
+                    if current_delta_type is None:
+                        current_delta_type = "audio"
                 returned_message.append(
                     cast(
                         OpenAIRealtimeEvents,
