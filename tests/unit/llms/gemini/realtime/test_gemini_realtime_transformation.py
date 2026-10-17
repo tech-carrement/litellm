@@ -5,7 +5,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 import litellm
 from litellm.llms.gemini.realtime.transformation import GeminiRealtimeConfig
 from litellm.types.llms.gemini import BidiGenerateContentServerMessage
@@ -2235,3 +2234,29 @@ def test_gemini_realtime_response_done_reports_no_grounding_when_none_ran():
 
     assert input_details.get("web_search_requests") is None
     assert input_details.get("google_maps_grounding_requests") is None
+
+
+def _speech_config_for(session: dict) -> dict | None:
+    messages = GeminiRealtimeConfig().transform_realtime_request(
+        json.dumps({"type": "session.update", "session": session}),
+        "gemini-3.8-live",
+        session_configuration_request=None,
+    )
+    return json.loads(messages[0])["setup"].get("generationConfig", {}).get("speechConfig")
+
+
+def test_gemini_output_language_reaches_speech_config_language_code():
+    """session.audio.output.language -> speechConfig.languageCode, next to the voice."""
+    speech_config = _speech_config_for({"audio": {"output": {"voice": "Puck", "language": "fr-FR"}}})
+    assert speech_config is not None
+    assert speech_config["languageCode"] == "fr-FR"
+    assert speech_config["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"] == "Puck"
+
+
+def test_gemini_output_language_is_kept_without_a_voice():
+    assert _speech_config_for({"audio": {"output": {"language": "fr-FR"}}}) == {"languageCode": "fr-FR"}
+
+
+def test_gemini_output_language_is_kept_when_an_openai_voice_is_dropped():
+    speech_config = _speech_config_for({"audio": {"output": {"voice": "marin", "language": "fr-FR"}}})
+    assert speech_config == {"languageCode": "fr-FR"}
