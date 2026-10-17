@@ -773,6 +773,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         conversation_id: str,
         delta_type: ALL_DELTA_TYPES,
         session_configuration_request: str | None = None,
+        include_response_created: bool = True,
     ) -> list[OpenAIRealtimeEvents]:
         session_configuration_request_dict: BidiGenerateContentSetup = {}
         if session_configuration_request is not None:
@@ -803,7 +804,10 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 "max_output_tokens": _max_output_tokens,
             },
         )
-        response_items.append(response_created)
+        # Une réponse déjà ouverte (parole qui suit un appel d'outil dans le même tour)
+        # ne se re-crée pas : sinon deux response.created pour un seul response.done.
+        if include_response_created:
+            response_items.append(response_created)
 
         ## - return response.output_item.added
         response_output_item_added: Final = OpenAIRealtimeStreamResponseOutputItemAdded(
@@ -1239,6 +1243,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             openai_event == OpenAIRealtimeEventTypes.RESPONSE_TEXT_DELTA
             or openai_event == OpenAIRealtimeEventTypes.RESPONSE_AUDIO_DELTA
         ):
+            _response_was_open = current_response_id is not None
             current_response_id = current_response_id or f"resp_{uuid.uuid4()}"
             if not current_output_item_id:
                 # send the list of standard 'new' content.delta events
@@ -1250,6 +1255,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                     output_item_id=current_output_item_id,
                     conversation_id=current_conversation_id,
                     delta_type=delta_type,
+                    include_response_created=not _response_was_open,
                 )
 
             # send the list of standard 'new' content.delta events
@@ -1441,6 +1447,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
 
             output_tx: Final = server_content.get("outputTranscription")
             if isinstance(output_tx, dict) and output_tx.get("text"):
+                _tx_response_was_open = current_response_id is not None
                 if current_response_id is None:
                     current_response_id = f"resp_{uuid.uuid4()}"
                 if current_output_item_id is None:
@@ -1453,6 +1460,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                             output_item_id=current_output_item_id,
                             conversation_id=current_conversation_id,
                             delta_type="audio",
+                            include_response_created=not _tx_response_was_open,
                         )
                     )
                     # with avatar video the audio is muxed in the mp4, no audio part comes:
@@ -1640,60 +1648,17 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                         )
                     )
 
+                # Un toolCall ne termine PAS la réponse. Gemini enchaîne la parole dans le
+                # MÊME tour : mesuré sur Vertex, des response.output_audio.done arrivaient
+                # après ce response.done, donc après la clôture. Un done par appel d'outil,
+                # c'est la rafale que les clients lisent comme autant de fins de tour (8
+                # response.done pour 5 response.created sur un seul tour utilisateur).
+                # La fin de tour, chez Gemini, c'est serverContent.turnComplete et lui seul.
+                # Les tokens sont mis de côté pour le response.done de ce turnComplete.
                 resolved_tool_call_usage_metadata = self._consume_usage_metadata_for_response_done(json_message)
                 if resolved_tool_call_usage_metadata is not None:
-                    _tool_call_chat_completion_usage = VertexGeminiConfig.calculate_usage(
-                        completion_response=cast(
-                            BidiGenerateContentServerMessage,
-                            {
-                                **json_message,
-                                "usageMetadata": resolved_tool_call_usage_metadata,
-                            },
-                        ),
-                    )
-                else:
-                    _tool_call_chat_completion_usage = get_empty_usage()
-                tool_call_responses_api_usage = (
-                    LiteLLMCompletionResponsesConfig.transform_chat_completion_usage_to_responses_usage(
-                        _tool_call_chat_completion_usage,
-                    )
-                )
-                _tool_usage_dict = tool_call_responses_api_usage.model_dump()
-                self._add_pipecat_usage_detail_aliases(_tool_usage_dict)
-                tool_call_done_event = OpenAIRealtimeDoneEvent(
-                    type="response.done",
-                    event_id=f"event_{uuid.uuid4()}",
-                    response=OpenAIRealtimeResponseDoneObject(
-                        id=current_response_id,
-                        object="realtime.response",
-                        status="completed",
-                        status_details=None,
-                        output=[
-                            {
-                                "id": te["item_id"],
-                                "object": "realtime.item",
-                                "type": "function_call",
-                                "status": "completed",
-                                "call_id": te["call_id"],
-                                "name": te["name"],
-                                "arguments": te["arguments"],
-                            }
-                            for te in tool_call_events
-                        ],
-                        conversation_id=current_conversation_id,
-                        modalities=tool_call_modalities,
-                        usage=_tool_usage_dict,
-                    ),
-                )
-                tool_call_temperature = tool_call_generation_config.get("temperature")
-                if tool_call_temperature is not None:
-                    tool_call_done_event["response"]["temperature"] = tool_call_temperature
-                tool_call_max_output_tokens = tool_call_generation_config.get("maxOutputTokens")
-                if tool_call_max_output_tokens is not None:
-                    tool_call_done_event["response"]["max_output_tokens"] = cast(int, tool_call_max_output_tokens)
-                returned_message.append(tool_call_done_event)
+                    self._pending_usage_metadata = resolved_tool_call_usage_metadata
                 current_output_item_id = None
-                current_response_id = None
             elif openai_event == OpenAIRealtimeEventTypes.RESPONSE_DONE:
                 _has_pending_function_call = current_item_chunks and any(
                     chunk.get("item", {}).get("type") == "function_call" for chunk in current_item_chunks
