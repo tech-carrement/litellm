@@ -342,8 +342,9 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
             "voice",
             # DownstreamPatch(dialogpro): langue parlée (speechConfig.languageCode).
             "language",
-            # DownstreamPatch(dialogpro): Live Avatar (avatarConfig.avatarName).
+            # DownstreamPatch(dialogpro): Live Avatar (avatarConfig.avatarName / videoBitrateBps).
             "avatar",
+            "avatar_video_bitrate_bps",
         ]
 
     def map_openai_params(self, optional_params: dict, non_default_params: dict) -> dict:
@@ -396,7 +397,11 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 # DownstreamPatch(dialogpro): Gemini 3.8 Live Avatar — a prebuilt
                 # avatar name; pairs with responseModalities ["VIDEO"] (the caller
                 # sends output_modalities ["video"]). Top-level setup field.
-                optional_params["avatarConfig"] = {"avatarName": value}
+                optional_params.setdefault("avatarConfig", {})["avatarName"] = value
+            elif key == "avatar_video_bitrate_bps" and isinstance(value, int) and value > 0:
+                # Google's default avatar stream is ~8 Mbit/s (measured 2026-10-17);
+                # the caller caps it.
+                optional_params.setdefault("avatarConfig", {})["videoBitrateBps"] = value
         if len(optional_params["generationConfig"]) == 0:
             optional_params.pop("generationConfig")
         return optional_params
@@ -886,8 +891,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
     def transform_video_delta_events(
         self,
         message: BidiGenerateContentServerContent,
-        output_item_id: str,
-        response_id: str,
+        output_item_id: str | None,
+        response_id: str | None,
     ) -> list[dict]:
         """DownstreamPatch(dialogpro): Gemini 3.8 Live Avatar.
 
@@ -1403,6 +1408,27 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                         },
                     )
                 )
+            # DownstreamPatch(dialogpro): Live Avatar video is a SIDE CHANNEL. The
+            # stream flows continuously (idle animation included) outside any turn
+            # (measured 2026-10-17), so a video-only model turn must not open a
+            # response or touch the delta state: the spoken turn is opened by its
+            # first output transcript and closed by turnComplete, as for a
+            # transcription-only turn. Ids are the current ones, or null.
+            _avatar_turn: Final = server_content.get("modelTurn")
+            if isinstance(_avatar_turn, dict):
+                _avatar_parts: Final = _avatar_turn.get("parts") or []
+                if _avatar_parts and all(self._is_video_part(p) for p in _avatar_parts):
+                    returned_message.extend(
+                        cast(
+                            list[OpenAIRealtimeEvents],
+                            self.transform_video_delta_events(
+                                cast(BidiGenerateContentServerContent, server_content),
+                                current_output_item_id,
+                                current_response_id,
+                            ),
+                        )
+                    )
+                    server_content.pop("modelTurn")
             input_tx: Final = server_content.get("inputTranscription")
             if isinstance(input_tx, dict) and input_tx.get("text"):
                 transcription_usage: Final = self._consume_input_transcription_usage_estimate(model)

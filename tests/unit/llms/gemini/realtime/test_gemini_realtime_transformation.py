@@ -2501,3 +2501,33 @@ def test_gemini_video_output_tokens_survive_response_done():
     otd = done[0]["response"]["usage"]["output_token_details"]
     assert otd["audio_tokens"] == 8
     assert otd["video_tokens"] == 42
+
+
+def test_gemini_video_only_frame_never_opens_a_response():
+    """Live Avatar video flows continuously, idle animation included, outside any
+    turn: a video-only frame must be a side channel — no response.created, no
+    item, state untouched; the spoken turn is opened by the first transcript."""
+    config = GeminiRealtimeConfig()
+    frame = {"serverContent": {"modelTurn": {"parts": [{"inlineData": {"mimeType": "video/mp4", "data": "bXA0"}}]}}}
+    result = config.transform_realtime_response(
+        json.dumps(frame), "gemini-3.8-live", MagicMock(), realtime_response_transform_input=_transform_input()
+    )
+    types = [e["type"] for e in result["response"]]
+    assert types == ["response.output_video.delta"], types
+    assert result["response"][0]["response_id"] is None
+    assert result["current_response_id"] is None
+    assert result["current_output_item_id"] is None
+    assert result["current_delta_type"] is None
+
+
+def test_gemini_avatar_video_bitrate_is_mapped():
+    """Google's default avatar stream is ~8 Mbit/s (measured); the caller caps it."""
+    config = GeminiRealtimeConfig()
+    session_update = {
+        "type": "session.update",
+        "session": {"output_modalities": ["video"], "avatar": "Ben", "avatar_video_bitrate_bps": 1_500_000},
+    }
+    messages = config.transform_realtime_request(
+        json.dumps(session_update), "gemini-3.8-live", session_configuration_request=None
+    )
+    assert json.loads(messages[0])["setup"]["avatarConfig"] == {"avatarName": "Ben", "videoBitrateBps": 1_500_000}
