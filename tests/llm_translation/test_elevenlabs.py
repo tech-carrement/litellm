@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 import httpx
 
 import litellm
+from litellm.types.utils import TranscriptionResponse
 from litellm.llms.elevenlabs.audio_transcription.transformation import ElevenLabsAudioTranscriptionConfig
 from base_audio_transcription_unit_tests import BaseLLMAudioTranscriptionTest
 
@@ -237,3 +238,41 @@ def test_transform_audio_transcription_request_sends_bool_fields_lowercase():
 
     assert form_data["diarize"] == "true"
     assert form_data["use_multi_channel"] == "false"
+
+
+def _transform(payload: object) -> TranscriptionResponse:
+    return ElevenLabsAudioTranscriptionConfig().transform_audio_transcription_response(
+        raw_response=httpx.Response(200, json=payload)
+    )
+
+
+def test_transform_audio_transcription_response_keeps_multichannel_transcripts():
+    """With use_multi_channel=true ElevenLabs answers with one transcript per channel
+    (channel_index + words) and the billed audio_duration_secs; both must survive."""
+    response: Final = _transform(
+        {
+            "language_code": "fra",
+            "transcripts": [
+                {
+                    "channel_index": 0,
+                    "text": "bonjour",
+                    "words": [{"text": "bonjour", "type": "word", "start": 0.1, "end": 0.5}],
+                },
+                {
+                    "channel_index": 1,
+                    "text": "allo",
+                    "words": [{"text": "allo", "type": "word", "start": 0.2, "end": 0.6}],
+                },
+            ],
+            "audio_duration_secs": 12.7,
+        }
+    )
+
+    assert [t["channel_index"] for t in response["transcripts"]] == [0, 1]
+    assert response["audio_duration_secs"] == 12.7
+
+
+def test_transform_audio_transcription_response_without_transcripts_has_no_transcripts_key():
+    response: Final = _transform({"language_code": "fra", "text": "bonjour", "words": []})
+
+    assert "transcripts" not in response
