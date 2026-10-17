@@ -1,12 +1,13 @@
 import os
 
-from typing import Any, Dict
+from typing import Any, Dict, Final
 
 import pytest
 from unittest.mock import patch, MagicMock
 import httpx
 
 import litellm
+from litellm.llms.elevenlabs.audio_transcription.transformation import ElevenLabsAudioTranscriptionConfig
 from base_audio_transcription_unit_tests import BaseLLMAudioTranscriptionTest
 
 os.environ.setdefault("ELEVENLABS_API_KEY", "test-elevenlabs-key")
@@ -93,8 +94,8 @@ class TestElevenLabsAudioTranscription(BaseLLMAudioTranscriptionTest):
                     "diarize" in form_data
                 ), f"diarize should be in form data. Got: {list(form_data.keys())}"
                 assert (
-                    form_data["diarize"] == "True"
-                ), f"Expected diarize='True', got {form_data['diarize']}"
+                    form_data["diarize"] == "true"
+                ), f"Expected diarize='true', got {form_data['diarize']}"
 
                 # Check that OpenAI language parameter is mapped correctly
                 assert (
@@ -209,3 +210,30 @@ class TestElevenLabsTextToSpeechTransformation:
 
         assert voice_id in url
         assert "output_format=pcm_44100" in url
+
+
+def _request_form_data(optional_params: dict[str, object]) -> dict[str, object]:
+    request: Final = ElevenLabsAudioTranscriptionConfig().transform_audio_transcription_request(
+        model="scribe_v2",
+        audio_file=("speech.wav", b"RIFF....WAVEfmt ", "audio/wav"),
+        optional_params=optional_params,
+        litellm_params={},
+    )
+    assert isinstance(request.data, dict)
+    return request.data
+
+
+def test_transform_audio_transcription_request_sends_list_fields_as_repeated_parts():
+    """ElevenLabs reads a list such as keyterms as one multipart part per element;
+    str(list) would ship the Python repr as a single term."""
+    form_data: Final = _request_form_data({"keyterms": ["DialogPro", "Sauvage"]})
+
+    assert form_data["keyterms"] == ["DialogPro", "Sauvage"]
+
+
+def test_transform_audio_transcription_request_sends_bool_fields_lowercase():
+    """httpx form encoding does not lowercase booleans; ElevenLabs ignores "True"."""
+    form_data: Final = _request_form_data({"diarize": True, "use_multi_channel": False})
+
+    assert form_data["diarize"] == "true"
+    assert form_data["use_multi_channel"] == "false"
