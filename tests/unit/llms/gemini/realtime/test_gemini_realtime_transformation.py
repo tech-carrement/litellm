@@ -2531,3 +2531,33 @@ def test_gemini_avatar_video_bitrate_is_mapped():
         json.dumps(session_update), "gemini-3.8-live", session_configuration_request=None
     )
     assert json.loads(messages[0])["setup"]["avatarConfig"] == {"avatarName": "Ben", "videoBitrateBps": 1_500_000}
+
+
+def test_gemini_transcript_opened_response_is_closed_by_generation_complete():
+    """Live Avatar (VIDEO modality): no audio part ever arrives, the spoken turn is
+    opened by its first output transcript. generationComplete must then close the
+    item (audio.done + output_item.done) exactly as after an audio delta — measured:
+    without it the item never closed and the proxy's opening-turn guard dropped the
+    client's next trigger."""
+    config = GeminiRealtimeConfig()
+    state = _transform_input()
+    first = config.transform_realtime_response(
+        json.dumps({"serverContent": {"outputTranscription": {"text": "Bonjour, je "}}}),
+        "gemini-3.8-live", MagicMock(), realtime_response_transform_input=state,
+    )
+    assert [e["type"] for e in first["response"]][0] == "response.created"
+    assert first["current_delta_type"] == "audio"
+    state = _transform_input(
+        current_output_item_id=first["current_output_item_id"],
+        current_response_id=first["current_response_id"],
+        current_conversation_id=first["current_conversation_id"],
+        current_delta_type=first["current_delta_type"],
+    )
+    done = config.transform_realtime_response(
+        json.dumps({"serverContent": {"generationComplete": True}}),
+        "gemini-3.8-live", MagicMock(), realtime_response_transform_input=state,
+    )
+    types = [e["type"] for e in done["response"]]
+    assert "response.output_audio.done" in types and "response.output_item.done" in types, types
+    item_done = next(e for e in done["response"] if e["type"] == "response.output_item.done")
+    assert item_done["item"]["id"] == first["current_output_item_id"]
