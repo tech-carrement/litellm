@@ -2728,3 +2728,45 @@ def test_gemini_transcript_opened_response_is_closed_by_generation_complete():
     assert "response.output_audio.done" in types and "response.output_item.done" in types, types
     item_done = next(e for e in done["response"] if e["type"] == "response.output_item.done")
     assert item_done["item"]["id"] == first["current_output_item_id"]
+
+
+def test_gemini_input_transcription_item_is_announced_before_its_words():
+    """Fork-only (audit 11 Nov 2026): every inputTranscription fragment of a caller turn
+    shares ONE item_id, announced by input_audio_buffer.committed when the previous model
+    turn completes. The apps refuse a transcript whose item was announced before their
+    confirmation dialog opened; a fresh uuid per fragment made that guard dead on Gemini."""
+    from typing import Final
+
+    from litellm.types.realtime import RealtimeResponseTransformInput
+
+    config: Final = GeminiRealtimeConfig()
+    transform_input: Final[RealtimeResponseTransformInput] = {
+        "session_configuration_request": None,
+        "current_output_item_id": None,
+        "current_response_id": None,
+        "current_conversation_id": None,
+        "current_delta_chunks": None,
+        "current_item_chunks": None,
+        "current_delta_type": None,
+    }
+
+    def events(frame):
+        return config.transform_realtime_response(
+            json.dumps(frame), "gemini-3.1-flash-live-preview", MagicMock(),
+            realtime_response_transform_input=transform_input,
+        )["response"]
+
+    announced = [e for e in events({"serverContent": {"turnComplete": True}}) if e["type"] == "input_audio_buffer.committed"]
+    assert len(announced) == 1
+    item: Final = announced[0]["item_id"]
+
+    fragments = [
+        e
+        for text in ("oui", " vas-y")
+        for e in events({"serverContent": {"inputTranscription": {"text": text}}})
+    ]
+    assert [e["type"] for e in fragments] == ["conversation.item.input_audio_transcription.completed"] * 2
+    assert {e["item_id"] for e in fragments} == {item}
+
+    nxt = [e for e in events({"serverContent": {"turnComplete": True}}) if e["type"] == "input_audio_buffer.committed"]
+    assert nxt[0]["item_id"] != item
