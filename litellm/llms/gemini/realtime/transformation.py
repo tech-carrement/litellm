@@ -193,6 +193,13 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         # turns; buffer it here so the next response.done carries the token counts.
         self._pending_usage_metadata: dict | None = None
         self._unbilled_input_audio_bytes: int = 0
+        # Item of the caller's current turn (fork-only, audit 11 Nov 2026): every
+        # inputTranscription fragment of a turn shares it, and it is announced by an
+        # input_audio_buffer.committed when the previous model turn completes - BEFORE
+        # the caller's words are transcribed. The apps record items announced by
+        # input_audio_buffer.* to refuse a late transcript of words spoken before a
+        # confirmation dialog opened; a fresh uuid per fragment defeated that guard.
+        self._input_item_id: str | None = None
 
     def is_setup_message(self, msg_obj: dict) -> bool:
         return "setup" in msg_obj
@@ -1414,6 +1421,21 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 )
             if "turnComplete" in server_content:
                 self._generation_requested = False
+                # the caller's next turn starts now: announce its item before any of its
+                # (possibly late) transcription arrives. committed, not speech_started:
+                # clients flush their playback on speech_started.
+                self._input_item_id = f"item_{uuid.uuid4()}"
+                returned_message.append(
+                    cast(
+                        OpenAIRealtimeEvents,
+                        {
+                            "type": "input_audio_buffer.committed",
+                            "event_id": new_event_id(),
+                            "item_id": self._input_item_id,
+                            "previous_item_id": None,
+                        },
+                    )
+                )
             # Live Avatar video flows continuously, outside any turn: a video-only model
             # turn must not open a response; the spoken turn is opened by its transcript
             _avatar_parts: Final = self._model_turn_parts(
@@ -1431,6 +1453,19 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                 and input_tx["text"]
             ):
                 transcription_usage: Final = self._consume_input_transcription_usage_estimate(model)
+                if self._input_item_id is None:  # first turn of the session
+                    self._input_item_id = f"item_{uuid.uuid4()}"
+                    returned_message.append(
+                        cast(
+                            OpenAIRealtimeEvents,
+                            {
+                                "type": "input_audio_buffer.committed",
+                                "event_id": new_event_id(),
+                                "item_id": self._input_item_id,
+                                "previous_item_id": None,
+                            },
+                        )
+                    )
                 returned_message.append(
                     cast(
                         OpenAIRealtimeEvents,
@@ -1438,7 +1473,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
                             "type": "conversation.item.input_audio_transcription.completed",
                             "event_id": new_event_id(),
                             "transcript": input_tx["text"],
-                            "item_id": f"item_{uuid.uuid4()}",
+                            "item_id": self._input_item_id,
                             "content_index": 0,
                             **({} if transcription_usage is None else {"usage": transcription_usage}),
                         },
