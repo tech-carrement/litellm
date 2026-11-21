@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
 # Base image for building
-ARG LITELLM_BUILD_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:1d95114038f76513a9ace6fca107d5582b08c65981f81f61cb56bf7fd2ef216d
+ARG LITELLM_BUILD_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:ae9575b121f5776e2f04e192064bc2c5665af9d1c425d620dc773aca31698712
 
 # Runtime image
-ARG LITELLM_RUNTIME_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:1d95114038f76513a9ace6fca107d5582b08c65981f81f61cb56bf7fd2ef216d
+ARG LITELLM_RUNTIME_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:ae9575b121f5776e2f04e192064bc2c5665af9d1c425d620dc773aca31698712
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff
 # Pinned by digest like the other base images; bump explicitly on Node upgrades.
 ARG UI_BUILD_IMAGE=node:24.19-alpine3.24@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
@@ -61,6 +61,7 @@ RUN apk add --no-cache \
     python-3.13-dev \
     rust \
     openssl \
+    libssl3 \
     openssl-dev \
     nodejs \
     npm \
@@ -75,6 +76,7 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
 COPY pyproject.toml uv.lock ./
 COPY enterprise/pyproject.toml enterprise/
 COPY litellm-proxy-extras/pyproject.toml litellm-proxy-extras/
+COPY packaging/litellm-proxy/pyproject.toml packaging/litellm-proxy/
 
 # Install third-party dependencies (cached unless pyproject.toml/uv.lock change)
 RUN uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
@@ -100,7 +102,8 @@ COPY --from=ui-builder /ui/out/. litellm/proxy/_experimental/out/
 RUN sed -i 's/\r$//' docker/build_admin_ui.sh && chmod +x docker/build_admin_ui.sh && ./docker/build_admin_ui.sh
 
 # Install project and workspace packages (fast - deps already cached)
-RUN uv sync --frozen --no-default-groups --no-editable \
+RUN uv build --package litellm-proxy --wheel --out-dir /wheels
+RUN uv sync --frozen --no-install-package litellm-proxy --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --group admin-mcp \
@@ -109,6 +112,8 @@ RUN uv sync --frozen --no-default-groups --no-editable \
     --extra saml \
     --extra bedrock-realtime \
     --python python3.13
+
+RUN uv pip install --python /app/.venv/bin/python --no-deps /wheels/litellm_proxy-*.whl
 
 RUN HOME=/opt/prisma XDG_CACHE_HOME=/opt/prisma/.cache PRISMA_BINARY_CACHE_DIR=/opt/prisma/binaries \
     npm_config_cache=/root/.npm \
@@ -120,8 +125,8 @@ RUN sed -i 's/\r$//' docker/entrypoint.sh && chmod +x docker/entrypoint.sh && \
 FROM $LITELLM_BUILD_IMAGE AS liteadmin-builder
 COPY --from=uvbin /uv /usr/local/bin/uv
 RUN apk add --no-cache python-3.13
-ADD --checksum=sha256:2f7ae5cdd9d91731c0990e74a58239dc3e3fd2bf28dab23b55eafcdc47aaf87e \
-    https://github.com/BerriAI/litellm-admin-agent/archive/ef501e94bc9fbacb9233b922abf71427f030408c.tar.gz /tmp/liteadmin.tar.gz
+ADD --checksum=sha256:4fb1847e28e2be30ba76dac94f02c4903291326516a0f4ba772f6ffb8b25d05c \
+    https://github.com/BerriAI/litellm-admin-agent/archive/5661c805ce479a0cf11b842ea133cf8d22cd7e34.tar.gz /tmp/liteadmin.tar.gz
 RUN mkdir /tmp/liteadmin && tar xzf /tmp/liteadmin.tar.gz --strip-components=1 -C /tmp/liteadmin && \
     uv venv /opt/liteadmin --python python3.13 && \
     uv pip install --python /opt/liteadmin/bin/python --require-hashes -r /tmp/liteadmin/requirements.txt && \
@@ -141,7 +146,7 @@ USER root
 RUN echo "https://packages.wolfi.dev/os" >> /etc/apk/repositories
 
 # node (without npm) is required by the prisma CLI at runtime
-RUN apk add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile libevent
+RUN apk add --no-cache bash openssl libssl3 tzdata nodejs python-3.13 libsndfile libevent
 COPY --from=pgbouncer-builder /usr/local/bin/pgbouncer /usr/local/bin/pgbouncer
 
 WORKDIR /app
