@@ -405,6 +405,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         if self._manual_activity_open or not self._manual_turn_detection_enabled(session_configuration_request):
             return ()
         self._manual_activity_open = True
+        self._generation_requested = False  # a new audio turn: nothing is pending from the last one
         activity_start: Final[BidiGenerateContentRealtimeInput] = {"activityStart": {}}
         return (json.dumps({"realtimeInput": activity_start}),)
 
@@ -412,6 +413,7 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         if not self._manual_activity_open:
             return ()
         self._manual_activity_open = False
+        self._generation_requested = True  # activityEnd makes Gemini answer: swallow the response.create that follows
         activity_end: Final[BidiGenerateContentRealtimeInput] = {"activityEnd": {}}
         return (json.dumps({"realtimeInput": activity_end}),)
 
@@ -740,7 +742,8 @@ class GeminiRealtimeConfig(BaseRealtimeConfig):
         generation_config: Final = setup.get("generationConfig")
         if isinstance(generation_config, dict):
             modalities: Final = generation_config.get("responseModalities")
-            if isinstance(modalities, list):
+            # fork-only: a Live Avatar session (avatarConfig) answers in VIDEO, which coercion would drop
+            if isinstance(modalities, list) and not (setup.get("avatarConfig") and modalities == ["VIDEO"]):
                 generation_config["responseModalities"] = GeminiRealtimeConfig._coerce_response_modalities(
                     model, modalities
                 )

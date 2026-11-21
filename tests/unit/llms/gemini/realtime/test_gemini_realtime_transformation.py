@@ -1541,7 +1541,7 @@ _APPEND = json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64en
 
 def _realtime_input_keys(config: GeminiRealtimeConfig, client_event: str, setup: str | None) -> list[str]:
     frames = config.transform_realtime_request(client_event, "gemini-live-2.5-flash-native-audio", setup)
-    return [key for frame in frames for key in json.loads(frame)["realtimeInput"]]
+    return [key for frame in frames for key in json.loads(frame).get("realtimeInput", {})]
 
 
 @pytest.mark.parametrize("turn_end", ["input_audio_buffer.commit", "response.create"])
@@ -1599,7 +1599,10 @@ def test_gemini_automatic_vad_sends_no_activity_markers():
     keys = [_realtime_input_keys(config, event, None) for event in (_APPEND, commit)]
 
     assert keys == [["audio"], ["audioStreamEnd"]]
-    assert config.transform_realtime_request(response_create, "gemini-live-2.5-flash", None) == []
+    # fork-only: a bare response.create is honored as turnComplete (upstream swallows it)
+    assert [json.loads(f) for f in config.transform_realtime_request(response_create, "gemini-live-2.5-flash", None)] == [
+        {"clientContent": {"turnComplete": True}}
+    ]
 
 
 def test_gemini_tool_call_id_to_name_evicts_oldest_when_capped():

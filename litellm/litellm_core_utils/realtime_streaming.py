@@ -1251,7 +1251,12 @@ class RealTimeStreaming:
         self._held_client_content_bytes = 0
         self._held_client_content_deadline = None
         for message in held:
-            await self._send_to_backend(message)
+            # fork-only: Gemini Live drops content received before setupComplete, so a
+            # deferred setup keeps it with the other pending frames
+            if self._should_buffer_client_message_until_setup(message):
+                self._buffer_pending_message_until_setup(message)
+            else:
+                await self._send_to_backend(message)
 
     def _setup_deadline(self) -> float:
         content_deadline: Final = self._held_client_content_deadline

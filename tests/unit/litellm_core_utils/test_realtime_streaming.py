@@ -3395,6 +3395,9 @@ async def test_a_session_update_between_the_first_items_and_response_create_join
     )
 
     await streaming.client_ack_messages()
+    # fork-only: Gemini drops frames sent before setupComplete, so everything but the setup is held until then
+    streaming._backend_setup_complete = True
+    await streaming._flush_pending_messages_until_setup()
 
     frames: Final = [json.loads(call.args[0]) for call in backend_ws.send.await_args_list]
     assert [next(iter(frame)) for frame in frames] == ["setup", "clientContent"]
@@ -3509,6 +3512,9 @@ async def test_deferred_setup_merges_session_updates_until_the_first_content(mon
     )
 
     await streaming.client_ack_messages()
+    # fork-only: Gemini drops frames sent before setupComplete, so everything but the setup is held until then
+    streaming._backend_setup_complete = True
+    await streaming._flush_pending_messages_until_setup()
 
     frames: Final = [json.loads(call.args[0]) for call in backend_ws.send.await_args_list]
     assert [next(iter(frame)) for frame in frames] == ["setup", "clientContent"]
@@ -3541,6 +3547,9 @@ async def test_deferred_setup_sends_the_default_setup_before_text_content_that_c
     )
 
     await streaming.client_ack_messages()
+    # fork-only: Gemini drops frames sent before setupComplete, so everything but the setup is held until then
+    streaming._backend_setup_complete = True
+    await streaming._flush_pending_messages_until_setup()
 
     frames: Final = [json.loads(call.args[0]) for call in backend_ws.send.await_args_list]
     assert [next(iter(frame)) for frame in frames] == ["setup", "clientContent"]
@@ -3581,9 +3590,13 @@ async def test_a_transcription_guardrail_refuses_gemini_audio_it_cannot_screen(m
     )
 
     await streaming.client_ack_messages()
+    # fork-only: Gemini drops frames sent before setupComplete, so everything but the setup is held until then
+    streaming._backend_setup_complete = True
+    await streaming._flush_pending_messages_until_setup()
 
     frames: Final = [json.loads(call.args[0]) for call in backend_ws.send.await_args_list]
-    assert [next(iter(frame)) for frame in frames] == ["setup", "clientContent"]
+    # the bare response.create is honored as a turnComplete (fork-only), then the text item
+    assert [next(iter(frame)) for frame in frames] == ["setup", "clientContent", "clientContent"]
     refusals: Final = [
         event["error"]["event_id"]
         for event in _events_sent_to_client(streaming)
@@ -3606,6 +3619,9 @@ async def test_a_control_event_before_session_update_leaves_the_setup_open(monke
     )
 
     await streaming.client_ack_messages()
+    # fork-only: Gemini drops frames sent before setupComplete, so everything but the setup is held until then
+    streaming._backend_setup_complete = True
+    await streaming._flush_pending_messages_until_setup()
 
     frames: Final = [json.loads(call.args[0]) for call in backend_ws.send.await_args_list]
     assert [next(iter(frame)) for frame in frames] == ["setup", "clientContent"]
@@ -5995,6 +6011,7 @@ async def test_deferred_setup_holds_every_client_frame_until_backend_setup_compl
     from litellm.llms.gemini.realtime.transformation import GeminiRealtimeConfig
 
     client_ws = MagicMock()
+    client_ws.send_text = AsyncMock()
     session_update: Final = json.dumps({"type": "session.update", "session": {"modalities": ["audio"]}})
     item: Final = json.dumps(
         {
