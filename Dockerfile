@@ -102,6 +102,10 @@ COPY --from=ui-builder /ui/out/. litellm/proxy/_experimental/out/
 # Build Admin UI before final sync (applies the enterprise color override when present)
 RUN sed -i 's/\r$//' docker/build_admin_ui.sh && chmod +x docker/build_admin_ui.sh && ./docker/build_admin_ui.sh
 
+# fork-only: fat LTO + 1 codegen unit of the Rust extension is OOM-killed in an 8 GB Docker VM
+ENV CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+
 # Install project and workspace packages (fast - deps already cached)
 RUN uv build --package litellm-proxy --wheel --out-dir /wheels
 RUN uv sync --frozen --no-install-package litellm-proxy --no-default-groups --no-editable \
